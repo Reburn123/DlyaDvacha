@@ -70,11 +70,14 @@ jobs:
         run: gh workflow enable bot.yml --repo ${{ github.repository }}
 
       # Самоперезапуск: расписание GitHub ненадёжно (может не срабатывать часами),
-      # поэтому после успешного запуска бот сам ставит в очередь следующий.
-      # Cron выше остаётся запасным вариантом, если цепочка оборвётся.
+      # поэтому после запуска бот сам ставит в очередь следующий. Если запуск упал
+      # (например, временный сбой), ждём 4 минуты, чтобы не крутиться вхолостую.
+      # Cron выше остаётся запасным вариантом, если цепочка всё же оборвётся.
       - name: Start next run
-        if: steps.bot.outcome == 'success'
+        if: steps.bot.outcome == 'success' || steps.bot.outcome == 'failure'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run bot.yml --repo ${{ github.repository }} --ref ${{ github.ref_name }}
+        run: |
+          if [ "${{ steps.bot.outcome }}" != "success" ]; then sleep 240; fi
+          gh workflow run bot.yml --repo ${{ github.repository }} --ref ${{ github.ref_name }}

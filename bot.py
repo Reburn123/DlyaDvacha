@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-Бот для GitHub Actions: следит за 2ch.hk/<доска>/, постит НОВЫЕ треды в
-Telegram-канал, а в комментариях (чат обсуждений) воспроизводит ответы из треда.
+Бот для GitHub Actions: следит за 2ch.hk/<доска>/, постит ВСЕ новые треды в
+Telegram-канал, а в комментариях (чат обсуждений) воспроизводит ВСЕ ответы из треда.
 
-Один запуск живёт RUN_BUDGET секунд (по умолчанию 4 мин), потом сохраняет
-состояние в state.json и выходит. Workflow запускает его каждые 5 минут.
+Ничего не отбрасывается:
+  * новые треды падают в постоянную очередь (state.json) и уходят в канал по порядку,
+    с той скоростью, которую разрешает Telegram;
+  * комментарии доставляются по порядку, без лимита на число;
+  * пауза Telegram (flood control) не вешает бота: очередь просто ждёт.
 
-Только стандартная библиотека Python, ничего ставить не нужно.
+Один запуск живёт RUN_BUDGET секунд (по умолчанию 25 мин), потом сохраняет состояние
+и выходит; следующий запуск стартует сразу за ним.
+Только стандартная библиотека Python.
 """
 import html
 import json
@@ -23,15 +28,19 @@ from pathlib import Path
 
 # ---------------- настройки (переменные окружения) ----------------
 BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
-CHANNEL = os.environ["CHANNEL"].strip()                          # @username или -100...
+CHANNEL = os.environ["CHANNEL"].strip()                  # @username или -100...
 BOARD = os.getenv("BOARD", "b")
-RUN_BUDGET = int(os.getenv("RUN_BUDGET", "240"))         # сколько сек живёт один запуск
-LOOP_SLEEP = int(os.getenv("LOOP_SLEEP", "20"))          # пауза между проходами
-COMMENT_WINDOW = int(os.getenv("COMMENT_WINDOW", "1800"))  # сколько сек тред живёт в комментах
-MAX_COMMENTS = int(os.getenv("MAX_COMMENTS", "40"))      # максимум комментов на тред
-THREADS_PER_RUN = int(os.getenv("THREADS_PER_RUN", "3"))  # максимум новых тредов за запуск (антифлуд)
-SEND_DELAY = float(os.getenv("SEND_DELAY", "4"))         # пауза между отправками
-FORWARD_WAIT = int(os.getenv("FORWARD_WAIT", "600"))     # сколько ждать копию поста в чате обсуждений
+RUN_BUDGET = int(os.getenv("RUN_BUDGET", "1500"))        # сколько сек живёт один запуск
+LOOP_SLEEP = int(os.getenv("LOOP_SLEEP", "10"))          # пауза между проходами, когда делать нечего
+CATALOG_EVERY = int(os.getenv("CATALOG_EVERY", "15"))    # как часто смотреть каталог
+REFETCH_UNKNOWN = int(os.getenv("REFETCH_UNKNOWN", "60"))  # если каталог не отдаёт счётчик постов
+TRACK_MAX = int(os.getenv("TRACK_MAX", "172800"))        # максимум сколько следим за тредом (48 ч)
+MAX_COMMENTS = int(os.getenv("MAX_COMMENTS", "0"))       # 0 = без лимита
+SEND_DELAY = float(os.getenv("SEND_DELAY", "3.5"))       # пауза между отправками В ОДИН чат
+FORWARD_WAIT = int(os.getenv("FORWARD_WAIT", "7200"))    # сколько ждать копию поста в обсуждении
+OP_BURST = int(os.getenv("OP_BURST", "5"))               # тредов за один проход
+THREAD_BURST = int(os.getenv("THREAD_BURST", "3"))       # комментов на тред за проход
+TOTAL_BURST = int(os.getenv("TOTAL_BURST", "10"))        # комментов всего за проход
 BLOCKWORDS = [w.strip().lower() for w in os.getenv("BLOCKWORDS", "").split(",") if w.strip()]
 STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
 
@@ -84,6 +93,7 @@ def multipart(fields: dict, file):
 
 
 def tg(method, params=None, file=None, retries=3):
+    global flood_until
     params = {k: v for k, v in (params or {}).items() if v is not None}
     url = f"{TG_API}/bot{BOT_TOKEN}/{method}"
     for _ in range(retries):
@@ -99,11 +109,10 @@ def tg(method, params=None, file=None, retries=3):
         if d.get("ok"):
             return d["result"]
         if d.get("error_code") == 429:
-            global flood_until
             wait = d.get("parameters", {}).get("retry_after", 5)
             if wait > 30:
                 flood_until = time.time() + wait
-                log.warning("429: Telegram просит паузу %s сек. Не жду, отправка приостановлена.", wait)
+                log.warning("429: Telegram просит паузу %s сек. Не жду, очередь подождёт.", wait)
                 raise TgError(f"{method}: flood control {wait}s")
             log.warning("429 flood control, жду %ss", wait)
             time.sleep(wait + 1)
@@ -112,15 +121,15 @@ def tg(method, params=None, file=None, retries=3):
     raise TgError(f"{method}: retries exhausted")
 
 
-_last_send = 0.0
+_last_send: dict = {}
 
 
-def pace():
-    global _last_send
-    wait = SEND_DELAY - (time.time() - _last_send)
+def pace(chat_id):
+    """Не чаще одного сообщения в SEND_DELAY сек в один и тот же чат."""
+    wait = SEND_DELAY - (time.time() - _last_send.get(chat_id, 0))
     if wait > 0:
         time.sleep(wait)
-    _last_send = time.time()
+    _last_send[chat_id] = time.time()
 
 
 MEDIA = {
@@ -142,7 +151,7 @@ def send(chat_id, text, files=None, reply_to=None):
             media = (ext, data)
     reply = {"message_id": reply_to, "allow_sending_without_reply": True} if reply_to else None
 
-    pace()
+    pace(chat_id)
     if media:
         ext, data = media
         method, field = MEDIA.get(ext, ("sendDocument", "document"))
@@ -151,7 +160,7 @@ def send(chat_id, text, files=None, reply_to=None):
                       file=(field, f"file.{ext}", data))
         except TgError as e:
             log.warning("медиа не ушло (%s), шлю текстом", e)
-            if not text:
+            if flooded() or not text:
                 return None
     try:
         return tg("sendMessage", {"chat_id": chat_id, "text": text[:4000] or "…", "reply_parameters": reply})
@@ -204,18 +213,18 @@ def build_op(t):
 
 # ---------------- состояние ----------------
 def load_state():
+    st = {}
     if STATE_FILE.exists():
         try:
             st = json.loads(STATE_FILE.read_text())
         except Exception:
             log.error("state.json повреждён — начинаю с чистого листа (старое постить не буду)")
             st = {}
-    else:
-        st = {}
     st.setdefault("last_num", None)
     st.setdefault("offset", 0)
     st.setdefault("forwards", {})
     st.setdefault("threads", {})
+    st.setdefault("queue", [])
     st.setdefault("flood_until", 0)
     return st
 
@@ -242,9 +251,6 @@ def poll_updates(st, channel_id, group_id):
         for u in ups:
             st["offset"] = max(st["offset"], u["update_id"] + 1)
             m = u.get("message")
-            if m and m["chat"]["id"] == group_id:
-                log.info("Из чата обсуждений пришло сообщение %s (авто-копия поста: %s)",
-                         m["message_id"], bool(m.get("is_automatic_forward")))
             if not m or not m.get("is_automatic_forward") or m["chat"]["id"] != group_id:
                 continue
             origin = m.get("forward_origin") or {}
@@ -254,91 +260,127 @@ def poll_updates(st, channel_id, group_id):
                 st["forwards"][str(src_msg)] = m["message_id"]
         if len(ups) < 100:
             break
-    if len(st["forwards"]) > 300:   # чистим мусор
-        for k in sorted(st["forwards"], key=int)[:-200]:
-            st["forwards"].pop(k, None)
 
 
-def check_catalog(st, channel_id):
-    if flooded() and st["last_num"] is not None:
-        return
+def check_catalog(st):
+    """Читает каталог, кладёт ВСЕ новые треды в очередь. Возвращает {num: posts_count} или None."""
     threads = fetch_catalog()
     if not threads:
-        return
-    nums = [int(t["num"]) for t in threads]
+        return None
+    cat = {int(t["num"]): t.get("posts_count") for t in threads}
     if st["last_num"] is None:
-        st["last_num"] = max(nums)
+        st["last_num"] = max(cat)
         save_state(st)
         log.info("Первый запуск: база = %s. Старые треды НЕ постятся, жду новые.", st["last_num"])
-        return
+        return cat
 
     fresh = sorted((t for t in threads if int(t["num"]) > st["last_num"]), key=lambda t: int(t["num"]))
-    if not fresh:
-        return
-    st["last_num"] = int(fresh[-1]["num"])      # всё, что новее, считаем «увиденным»
-    save_state(st)
-    if len(fresh) > THREADS_PER_RUN - st.get("posted_this_run", 0):
-        keep = max(THREADS_PER_RUN - st.get("posted_this_run", 0), 0)
-        log.info("Новых тредов %s, беру последние %s (антифлуд)", len(fresh), keep)
-        fresh = fresh[len(fresh) - keep:] if keep else []
-
-    for t in fresh:
-        blob = (clean(t.get("subject", "")) + " " + clean(t.get("comment", ""))).lower()
-        if any(w in blob for w in BLOCKWORDS):
-            log.info("Тред %s пропущен по фильтру", t["num"])
-            continue
-        msg = send(channel_id, build_op(t), t.get("files"))
-        if not msg:
-            continue
-        st["posted_this_run"] = st.get("posted_this_run", 0) + 1
-        st["threads"][str(t["num"])] = {
-            "channel_msg": msg["message_id"], "gid": None, "id_map": {},
-            "last_post": int(t["num"]), "sent": 0,
-            "created": time.time(), "deadline": 0,
-        }
+    if fresh:
+        st["last_num"] = int(fresh[-1]["num"])
+        for t in fresh:
+            blob = (clean(t.get("subject", "")) + " " + clean(t.get("comment", ""))).lower()
+            if any(w in blob for w in BLOCKWORDS):
+                log.info("Тред %s пропущен по фильтру", t["num"])
+                continue
+            f = (t.get("files") or [{}])[0].get("path")
+            st["queue"].append({"num": int(t["num"]), "text": build_op(t),
+                                "files": [{"path": f}] if f else None, "tries": 0})
         save_state(st)
-        log.info("Тред %s запощен (msg %s)", t["num"], msg["message_id"])
+        log.info("Новых тредов: %s, в очереди на публикацию: %s", len(fresh), len(st["queue"]))
+    return cat
 
 
-def process_threads(st, group_id, hard_deadline):
+def post_queue(st, channel_id):
+    """Публикует треды из очереди по порядку. Возвращает сколько ушло."""
+    done = 0
+    while st["queue"] and done < OP_BURST and not flooded():
+        item = st["queue"][0]
+        msg = send(channel_id, item["text"], item.get("files"))
+        if msg:
+            st["queue"].pop(0)
+            st["threads"][str(item["num"])] = {
+                "channel_msg": msg["message_id"], "gid": None, "id_map": {},
+                "last_post": item["num"], "sent": 0, "created": time.time(),
+                "pc": None, "more": False, "fetched_at": 0, "fails": {},
+            }
+            done += 1
+            save_state(st)
+            log.info("Тред %s запощен (msg %s)", item["num"], msg["message_id"])
+        else:
+            if flooded():
+                break
+            item["tries"] = item.get("tries", 0) + 1
+            if item["tries"] >= 5:
+                log.error("Тред %s не удалось отправить 5 раз, пропускаю", item["num"])
+                st["queue"].pop(0)
+                save_state(st)
+            else:
+                break       # порядок важен: повторим на следующем проходе
+    return done
+
+
+def resolve_forwards(st):
     now = time.time()
     for key in list(st["threads"]):
         th = st["threads"][key]
-        if th["gid"] is None:
-            g = st["forwards"].pop(str(th["channel_msg"]), None)
-            if g:
-                th["gid"] = g
-                th["id_map"][key] = g
-                th["deadline"] = now + COMMENT_WINDOW
-            elif now - th["created"] > FORWARD_WAIT:
-                log.warning("Тред %s: копия поста в чате обсуждений не пришла, бросаю", key)
-                del st["threads"][key]
-                continue
-            else:
-                continue
-        if now > th["deadline"] or th["sent"] >= MAX_COMMENTS:
-            log.info("Тред %s завершён (%s комментов)", key, th["sent"])
+        if th["gid"] is not None:
+            continue
+        g = st["forwards"].pop(str(th["channel_msg"]), None)
+        if g:
+            th["gid"] = g
+            th["id_map"][key] = g
+            log.info("Тред %s: копия в обсуждении найдена (%s)", key, g)
+        elif now - th["created"] > FORWARD_WAIT:
+            log.warning("Тред %s: копия поста в чате обсуждений так и не пришла — бот точно админ группы?", key)
             del st["threads"][key]
+
+
+def process_threads(st, group_id, cat):
+    """Доставляет новые комментарии. Возвращает сколько отправлено."""
+    now = time.time()
+    total = 0
+    for key in sorted(st["threads"], key=int):
+        th = st["threads"].get(key)
+        if th is None or th["gid"] is None:
+            continue
+        if total >= TOTAL_BURST or flooded():
+            break
+        num = int(key)
+        alive = cat is None or num in cat
+        pc = cat.get(num) if cat else None
+        due = (th.get("more") or not alive or (pc is not None and pc != th.get("pc"))
+               or (pc is None and now - th.get("fetched_at", 0) >= REFETCH_UNKNOWN))
+        if not due:
+            if now - th["created"] > TRACK_MAX:
+                del st["threads"][key]
             continue
 
         status, posts = fetch_posts(key)
+        th["fetched_at"] = now
         if status == 404:
+            log.info("Тред %s удалён/закрыт, перестаю следить", key)
             del st["threads"][key]
             continue
         if posts is None:
             continue
+
         fails = th.setdefault("fails", {})
+        left = False
+        sent_here = 0
         for p in posts:
             n = int(p["num"])
             if n <= th["last_post"]:
                 continue
-            if time.time() > hard_deadline or th["sent"] >= MAX_COMMENTS:
+            if MAX_COMMENTS and th["sent"] >= MAX_COMMENTS:
                 break
             text = clean(p.get("comment", ""))
             files = p.get("files") or None
             if not text and not files:
                 th["last_post"] = n
                 continue
+            if sent_here >= THREAD_BURST or total >= TOTAL_BURST or flooded():
+                left = True
+                break
             m = re.search(r">>(\d+)", text)
             target = th["id_map"].get(m.group(1), th["gid"]) if m else th["gid"]
             sent = send(group_id, text, files, reply_to=target)
@@ -346,19 +388,30 @@ def process_threads(st, group_id, hard_deadline):
                 th["last_post"] = n
                 th["id_map"][str(n)] = sent["message_id"]
                 th["sent"] += 1
+                sent_here += 1
+                total += 1
                 log.info("Тред %s: комментарий %s отправлен", key, n)
             elif flooded():
-                break              # пауза Telegram: повторим позже, ошибку не засчитываем
+                left = True
+                break
             else:
                 fails[str(n)] = fails.get(str(n), 0) + 1
                 if fails[str(n)] >= 3:
                     log.warning("Тред %s: комментарий %s не ушёл 3 раза, пропускаю", key, n)
                     th["last_post"] = n
                 else:
-                    log.warning("Тред %s: комментарий %s не ушёл, повторю позже", key, n)
-                    break          # сохраняем порядок, повторим на следующем проходе
+                    log.warning("Тред %s: комментарий %s не ушёл, повторю", key, n)
+                    left = True
+                    break
             save_state(st)
-    save_state(st)
+
+        th["more"] = left
+        if not left:
+            th["pc"] = pc
+            if not alive or (MAX_COMMENTS and th["sent"] >= MAX_COMMENTS) or now - th["created"] > TRACK_MAX:
+                log.info("Тред %s завершён (%s комментов)", key, th["sent"])
+                del st["threads"][key]
+    return total
 
 
 def main():
@@ -377,7 +430,7 @@ def main():
         save_state(st)
         os._exit(0)
     signal.signal(signal.SIGALRM, on_alarm)
-    signal.alarm(RUN_BUDGET + 90)
+    signal.alarm(RUN_BUDGET + 120)
 
     try:
         tg("deleteWebhook")
@@ -399,23 +452,35 @@ def main():
         print(f"::error::Бота нет в группе обсуждений или нет доступа: {e}")
 
     start = time.time()
-    hard = start + RUN_BUDGET + 40
-    st["posted_this_run"] = 0
+    cat, last_cat, last_beat = None, 0.0, start
+    log.info("Старт. В очереди: %s, отслеживаю тредов: %s", len(st["queue"]), len(st["threads"]))
     while True:
         poll_updates(st, channel_id, group_id)
-        check_catalog(st, channel_id)
-        process_threads(st, group_id, hard)
+        if time.time() - last_cat >= CATALOG_EVERY:
+            c = check_catalog(st)
+            if c is not None:
+                cat = c
+            last_cat = time.time()
+        ops = post_queue(st, channel_id)
+        resolve_forwards(st)
+        cms = process_threads(st, group_id, cat)
         save_state(st)
-        for k, th in st["threads"].items():
-            log.info("Активный тред %s: копия в обсуждении=%s, комментов=%s, последний пост=%s",
-                     k, th["gid"], th["sent"], th["last_post"])
-        if time.time() + LOOP_SLEEP >= start + RUN_BUDGET:
+
+        more = any(t.get("more") for t in st["threads"].values())
+        if ops or cms or time.time() - last_beat > 300:
+            log.info("Проход: тредов отправлено %s, комментов %s | очередь %s, слежу за %s%s",
+                     ops, cms, len(st["queue"]), len(st["threads"]),
+                     f" | пауза Telegram ещё {int(flood_until - time.time())}с" if flooded() else "")
+            last_beat = time.time()
+        busy = (ops or cms or st["queue"] or more) and not flooded()
+        pause = 1 if busy else LOOP_SLEEP
+        if time.time() + pause >= start + RUN_BUDGET:
             break
         if flooded() and flood_until > start + RUN_BUDGET:
             log.info("Пауза Telegram длится дольше запуска, выхожу раньше")
             break
-        time.sleep(LOOP_SLEEP)
-    log.info("Запуск завершён")
+        time.sleep(pause)
+    log.info("Запуск завершён. В очереди осталось: %s", len(st["queue"]))
 
 
 if __name__ == "__main__":

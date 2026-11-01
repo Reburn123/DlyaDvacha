@@ -2,22 +2,23 @@ name: dvach-bot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # GitHub запускает не точно, возможны задержки
-  workflow_dispatch:         # ручной запуск кнопкой
+    - cron: "*/15 * * * *"   # каждые 15 минут ставит в очередь следующий запуск
+  workflow_dispatch:         # ручной запуск кнопкой (нужен только для проверки)
 
-# Запуски не должны идти одновременно: иначе будут дубли постов
+# Запуски идут строго по одному, следующий стартует сразу, как закончится текущий.
+# Так бот работает практически непрерывно и без дублей.
 concurrency:
   group: dvach-bot
   cancel-in-progress: false
 
 permissions:
   contents: read
-  actions: write             # нужно только для чистки старых кэшей
+  actions: write             # чистка кэшей и защита расписания от отключения
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -25,7 +26,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Состояние бота (последний тред, активные треды) живёт в кэше
+      # Состояние бота (очередь, активные треды) живёт в кэше
       - name: Restore state
         uses: actions/cache/restore@v4
         with:
@@ -38,6 +39,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHANNEL: ${{ secrets.CHANNEL }}
           BOARD: b
+          RUN_BUDGET: "1500"       # 25 минут работы за один запуск
           # BLOCKWORDS: "слово1,слово2"
         run: python bot.py
 
@@ -56,3 +58,12 @@ jobs:
         run: |
           gh cache list --key state- --sort created_at --order desc --limit 100 --json id --jq '.[5:][].id' \
             | xargs -r -n1 gh cache delete
+
+      # GitHub отключает расписание после 60 дней без активности в репозитории;
+      # повторное «включение» workflow сбрасывает этот таймер
+      - name: Keep schedule alive
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow enable bot.yml --repo ${{ github.repository }}

@@ -3,7 +3,7 @@ name: dvach-bot
 on:
   schedule:
     - cron: "*/15 * * * *"   # каждые 15 минут ставит в очередь следующий запуск
-  workflow_dispatch:         # ручной запуск кнопкой (нужен только для проверки)
+  workflow_dispatch:         # ручной запуск; им же бот сам перезапускает себя в конце
 
 # Запуски идут строго по одному, следующий стартует сразу, как закончится текущий.
 # Так бот работает практически непрерывно и без дублей.
@@ -35,6 +35,7 @@ jobs:
           restore-keys: state-
 
       - name: Run bot
+        id: bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHANNEL: ${{ secrets.CHANNEL }}
@@ -67,3 +68,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow enable bot.yml --repo ${{ github.repository }}
+
+      # Самоперезапуск: расписание GitHub ненадёжно (может не срабатывать часами),
+      # поэтому после успешного запуска бот сам ставит в очередь следующий.
+      # Cron выше остаётся запасным вариантом, если цепочка оборвётся.
+      - name: Start next run
+        if: steps.bot.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run bot.yml --repo ${{ github.repository }} --ref ${{ github.ref_name }}

@@ -30,7 +30,7 @@ LOOP_SLEEP = int(os.getenv("LOOP_SLEEP", "20"))          # пауза между
 COMMENT_WINDOW = int(os.getenv("COMMENT_WINDOW", "1800"))  # сколько сек тред живёт в комментах
 MAX_COMMENTS = int(os.getenv("MAX_COMMENTS", "40"))      # максимум комментов на тред
 THREADS_PER_RUN = int(os.getenv("THREADS_PER_RUN", "3"))  # максимум новых тредов за запуск (антифлуд)
-SEND_DELAY = float(os.getenv("SEND_DELAY", "3"))         # пауза между отправками
+SEND_DELAY = float(os.getenv("SEND_DELAY", "4"))         # пауза между отправками
 FORWARD_WAIT = int(os.getenv("FORWARD_WAIT", "600"))     # сколько ждать копию поста в чате обсуждений
 BLOCKWORDS = [w.strip().lower() for w in os.getenv("BLOCKWORDS", "").split(",") if w.strip()]
 STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
@@ -58,6 +58,13 @@ def http(url, data=None, headers=None, timeout=30):
 
 class TgError(Exception):
     pass
+
+
+flood_until = 0.0     # до какого момента Telegram просит не слать сообщения
+
+
+def flooded() -> bool:
+    return time.time() < flood_until
 
 
 def multipart(fields: dict, file):
@@ -92,7 +99,12 @@ def tg(method, params=None, file=None, retries=3):
         if d.get("ok"):
             return d["result"]
         if d.get("error_code") == 429:
+            global flood_until
             wait = d.get("parameters", {}).get("retry_after", 5)
+            if wait > 30:
+                flood_until = time.time() + wait
+                log.warning("429: Telegram просит паузу %s сек. Не жду, отправка приостановлена.", wait)
+                raise TgError(f"{method}: flood control {wait}s")
             log.warning("429 flood control, жду %ss", wait)
             time.sleep(wait + 1)
             continue
@@ -119,6 +131,8 @@ MEDIA = {
 
 def send(chat_id, text, files=None, reply_to=None):
     """Шлёт текст или (первый файл + подпись). Возвращает Message или None."""
+    if flooded():
+        return None
     media = None
     if files:
         path = files[0].get("path", "")
@@ -202,10 +216,12 @@ def load_state():
     st.setdefault("offset", 0)
     st.setdefault("forwards", {})
     st.setdefault("threads", {})
+    st.setdefault("flood_until", 0)
     return st
 
 
 def save_state(st):
+    st["flood_until"] = flood_until
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(st, ensure_ascii=False))
     tmp.replace(STATE_FILE)
@@ -244,6 +260,8 @@ def poll_updates(st, channel_id, group_id):
 
 
 def check_catalog(st, channel_id):
+    if flooded() and st["last_num"] is not None:
+        return
     threads = fetch_catalog()
     if not threads:
         return
@@ -329,6 +347,8 @@ def process_threads(st, group_id, hard_deadline):
                 th["id_map"][str(n)] = sent["message_id"]
                 th["sent"] += 1
                 log.info("Тред %s: комментарий %s отправлен", key, n)
+            elif flooded():
+                break              # пауза Telegram: повторим позже, ошибку не засчитываем
             else:
                 fails[str(n)] = fails.get(str(n), 0) + 1
                 if fails[str(n)] >= 3:
@@ -342,13 +362,22 @@ def process_threads(st, group_id, hard_deadline):
 
 
 def main():
+    global flood_until
     st = load_state()
+    flood_until = float(st.get("flood_until") or 0)
 
     def on_term(*_):
         save_state(st)
         sys.exit(0)
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, on_term)
+
+    def on_alarm(*_):                     # сторожевой таймер: запуск не может висеть вечно
+        log.error("Сторожевой таймер: запуск слишком долгий, сохраняю состояние и выхожу")
+        save_state(st)
+        os._exit(0)
+    signal.signal(signal.SIGALRM, on_alarm)
+    signal.alarm(RUN_BUDGET + 90)
 
     try:
         tg("deleteWebhook")
@@ -381,6 +410,9 @@ def main():
             log.info("Активный тред %s: копия в обсуждении=%s, комментов=%s, последний пост=%s",
                      k, th["gid"], th["sent"], th["last_post"])
         if time.time() + LOOP_SLEEP >= start + RUN_BUDGET:
+            break
+        if flooded() and flood_until > start + RUN_BUDGET:
+            log.info("Пауза Telegram длится дольше запуска, выхожу раньше")
             break
         time.sleep(LOOP_SLEEP)
     log.info("Запуск завершён")

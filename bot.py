@@ -22,8 +22,8 @@ import uuid
 from pathlib import Path
 
 # ---------------- настройки (переменные окружения) ----------------
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHANNEL = os.environ["CHANNEL"]                          # @username или -100...
+BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
+CHANNEL = os.environ["CHANNEL"].strip()                          # @username или -100...
 BOARD = os.getenv("BOARD", "b")
 RUN_BUDGET = int(os.getenv("RUN_BUDGET", "240"))         # сколько сек живёт один запуск
 LOOP_SLEEP = int(os.getenv("LOOP_SLEEP", "20"))          # пауза между проходами
@@ -180,7 +180,10 @@ def build_op(t):
     subject = clean(t.get("subject", ""))
     body = clean(t.get("comment", ""))
     link = f"{BASE}/{BOARD}/res/{t['num']}.html"
-    head = f"{subject}\n\n" if subject else ""
+    s = subject.lower().rstrip("….").strip()
+    low = body.lower()
+    dup = (not s) or low.startswith(s) or (bool(low) and s.startswith(low))
+    head = "" if dup else f"{subject}\n\n"
     limit = (1024 if t.get("files") else 4000) - len(link) - 4
     return f"{(head + body)[:limit].rstrip()}\n\n{link}"
 
@@ -223,6 +226,9 @@ def poll_updates(st, channel_id, group_id):
         for u in ups:
             st["offset"] = max(st["offset"], u["update_id"] + 1)
             m = u.get("message")
+            if m and m["chat"]["id"] == group_id:
+                log.info("Из чата обсуждений пришло сообщение %s (авто-копия поста: %s)",
+                         m["message_id"], bool(m.get("is_automatic_forward")))
             if not m or not m.get("is_automatic_forward") or m["chat"]["id"] != group_id:
                 continue
             origin = m.get("forward_origin") or {}
@@ -303,23 +309,34 @@ def process_threads(st, group_id, hard_deadline):
             continue
         if posts is None:
             continue
+        fails = th.setdefault("fails", {})
         for p in posts:
             n = int(p["num"])
             if n <= th["last_post"]:
                 continue
             if time.time() > hard_deadline or th["sent"] >= MAX_COMMENTS:
                 break
-            th["last_post"] = n
             text = clean(p.get("comment", ""))
             files = p.get("files") or None
             if not text and not files:
+                th["last_post"] = n
                 continue
             m = re.search(r">>(\d+)", text)
             target = th["id_map"].get(m.group(1), th["gid"]) if m else th["gid"]
             sent = send(group_id, text, files, reply_to=target)
             if sent:
+                th["last_post"] = n
                 th["id_map"][str(n)] = sent["message_id"]
                 th["sent"] += 1
+                log.info("Тред %s: комментарий %s отправлен", key, n)
+            else:
+                fails[str(n)] = fails.get(str(n), 0) + 1
+                if fails[str(n)] >= 3:
+                    log.warning("Тред %s: комментарий %s не ушёл 3 раза, пропускаю", key, n)
+                    th["last_post"] = n
+                else:
+                    log.warning("Тред %s: комментарий %s не ушёл, повторю позже", key, n)
+                    break          # сохраняем порядок, повторим на следующем проходе
             save_state(st)
     save_state(st)
 
@@ -342,6 +359,16 @@ def main():
     if not group_id:
         sys.exit("К каналу не привязан чат обсуждений. Привяжи группу в настройках канала.")
 
+    try:
+        me = tg("getMe")
+        role = tg("getChatMember", {"chat_id": group_id, "user_id": me["id"]}).get("status")
+        log.info("Роль бота в чате обсуждений: %s", role)
+        if role not in ("administrator", "creator"):
+            print("::error::Бот НЕ админ в группе обсуждений — он не увидит авто-копии постов и не сможет "
+                  "писать комментарии. Сделай его администратором группы.")
+    except TgError as e:
+        print(f"::error::Бота нет в группе обсуждений или нет доступа: {e}")
+
     start = time.time()
     hard = start + RUN_BUDGET + 40
     st["posted_this_run"] = 0
@@ -350,6 +377,9 @@ def main():
         check_catalog(st, channel_id)
         process_threads(st, group_id, hard)
         save_state(st)
+        for k, th in st["threads"].items():
+            log.info("Активный тред %s: копия в обсуждении=%s, комментов=%s, последний пост=%s",
+                     k, th["gid"], th["sent"], th["last_post"])
         if time.time() + LOOP_SLEEP >= start + RUN_BUDGET:
             break
         time.sleep(LOOP_SLEEP)

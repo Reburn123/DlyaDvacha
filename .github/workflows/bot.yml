@@ -1,0 +1,58 @@
+name: dvach-bot
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # GitHub запускает не точно, возможны задержки
+  workflow_dispatch:         # ручной запуск кнопкой
+
+# Запуски не должны идти одновременно: иначе будут дубли постов
+concurrency:
+  group: dvach-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write             # нужно только для чистки старых кэшей
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Состояние бота (последний тред, активные треды) живёт в кэше
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHANNEL: ${{ secrets.CHANNEL }}
+          BOARD: b
+          # BLOCKWORDS: "слово1,слово2"
+        run: python bot.py
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Cleanup old caches
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh cache list --key state- --sort created_at --order desc --limit 100 --json id --jq '.[5:][].id' \
+            | xargs -r -n1 gh cache delete
